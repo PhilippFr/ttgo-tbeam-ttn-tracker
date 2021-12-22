@@ -21,6 +21,17 @@
 
 */
 
+#include <Arduino.h>
+#include <SPI.h>
+
+#include <hal/hal_io.h>
+#include <hal/print_debug.h>
+#include <keyhandler.h>
+#include <lmic.h>
+
+#define DEVICE_TESTESP32
+#include "lorakeys.h"
+
 #include "configuration.h"
 #include "rom/rtc.h"
 #include <TinyGPS++.h>
@@ -44,6 +55,22 @@ bool packetSent, packetQueued;
     static uint8_t txBuffer[11] = {0x03, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 #endif
 
+// Pin mapping
+constexpr lmic_pinmap lmic_pins = {
+    .nss = NSS_GPIO,
+    .prepare_antenna_tx = nullptr,
+    .rst = RESET_GPIO,
+    .dio = {BUSY_GPIO, DIO0_GPIO},
+};
+
+// Radio class for SX1262
+RadioSx1262 radio{lmic_pins, ImageCalibrationBand::band_863_870};
+// Create an LMIC object with the right band
+LmicEu868 LMIC{radio};
+
+// buffer to save current lmic state (size may be reduce)
+RTC_DATA_ATTR uint8_t saveState[301];
+
 // deep sleep support
 RTC_DATA_ATTR int bootCount = 0;
 esp_sleep_source_t wakeCause;  // the reason we booted this time
@@ -53,6 +80,141 @@ esp_sleep_source_t wakeCause;  // the reason we booted this time
 // -----------------------------------------------------------------------------
 
 void buildPacket(uint8_t txBuffer[]);  // needed for platformio
+
+/*
+void callback(uint8_t message) {
+    bool ttn_joined = false;
+    if (EV_JOINED == message) {
+        ttn_joined = true;
+    }
+    if (EV_JOINING == message) {
+        if (ttn_joined) {
+            screen_print("TTN joining...\n");
+        } else {
+            screen_print("Joined TTN!\n");
+        }
+    }
+    if (EV_JOIN_FAILED == message) screen_print("TTN join failed\n");
+    if (EV_REJOIN_FAILED == message) screen_print("TTN rejoin failed\n");
+    if (EV_RESET == message) screen_print("Reset TTN connection\n");
+    if (EV_LINK_DEAD == message) screen_print("TTN link dead\n");
+    if (EV_ACK == message) screen_print("ACK received\n");
+    if (EV_PENDING == message) screen_print("Message discarded\n");
+    if (EV_QUEUED == message) screen_print("Message queued\n");
+
+    // We only want to say 'packetSent' for our packets (not packets needed for joining)
+    if (EV_TXCOMPLETE == message && packetQueued) {
+        screen_print("Message sent\n");
+        packetQueued = false;
+        packetSent = true;
+    }
+
+    if (EV_RESPONSE == message) {
+        screen_print("[TTN] Response: ");
+
+        size_t len = ttn_response_len();
+        uint8_t data[len];
+        // puts response into buffer "data"
+        ttn_response(data, len);
+
+        char buffer[6];
+        for (uint8_t i = 0; i < len; i++) {
+            snprintf(buffer, sizeof(buffer), "%02X", data[i]);
+            screen_print(buffer);
+        }
+        screen_print("\n");
+    }
+}
+*/
+
+void onEvent(EventType ev) {
+  switch (ev) {
+  case EventType::JOINING:
+    screen_print("TTN joining...\n");
+    PRINT_DEBUG(2, F("EV_JOINING"));
+    //        LMIC.setDrJoin(0);
+    break;
+  case EventType::JOINED:
+    screen_print("Joined TTN!\n");
+    PRINT_DEBUG(2, F("EV_JOINED"));
+    // disable ADR because if will be mobile.
+    // LMIC.setLinkCheckMode(false);
+    break;
+  case EventType::JOIN_FAILED:
+    screen_print("TTN join failed\n");
+    PRINT_DEBUG(2, F("EV_JOIN_FAILED"));
+    break;
+  case EventType::TXCOMPLETE:
+    PRINT_DEBUG(2, F("EV_TXCOMPLETE (includes waiting for RX windows)"));
+    if (LMIC.getTxRxFlags().test(TxRxStatus::ACK)) {
+      screen_print("ACK received\n");
+      PRINT_DEBUG(1, F("Received ack"));
+    }
+    if (LMIC.getDataLen()) {
+      screen_print("[TTN] Response: ");
+      PRINT_DEBUG(1, F("Received %d bytes of payload"), LMIC.getDataLen());
+      auto data = LMIC.getData();
+      if (data) {
+        uint8_t port = LMIC.getPort();
+      }
+    }
+    screen_print("Message sent\n");
+    // added 
+    packetQueued = false;
+    packetSent = true;
+    break;
+  case EventType::RESET:
+    screen_print("Reset TTN connection\n");
+    PRINT_DEBUG(2, F("EV_RESET"));
+    break;
+  case EventType::LINK_DEAD:
+    screen_print("TTN link dead\n");
+    PRINT_DEBUG(2, F("EV_LINK_DEAD"));
+    break;
+  case EventType::LINK_ALIVE:
+    PRINT_DEBUG(2, F("EV_LINK_ALIVE"));
+    break;
+  default:
+    PRINT_DEBUG(2, F("Unknown event"));
+    break;
+  }
+}
+
+void lora_init(){
+    SPI.begin();
+    // LMIC init
+    os_init();
+    LMIC.init();
+}
+
+void lora_setup(){
+    // Reset the MAC state. Session and pending data transfers will be discarded.
+    LMIC.reset();
+    LMIC.setEventCallBack(onEvent);
+    SetupLmicKey<appEui, devEui, appKey>::setup(LMIC);
+
+    // set clock error to allow good connection.
+    LMIC.setClockError(MAX_CLOCK_ERROR * 3 / 100);
+    LMIC.setAntennaPowerAdjustment(-14);
+    if (saveState[300] == 51) {
+        auto retrieve = RetrieveBuffer{saveState};
+        LMIC.loadState(retrieve);
+        // PRINT_DEBUG(1, F("State load len = %i"), lbuf);
+        saveState[300] = 0;
+    }
+};
+
+// ttn_send(txBuffer, sizeof(txBuffer), LORAWAN_PORT, confirmed);
+boolean lora_send(uint8_t *data, uint8_t dlen, uint8_t port, bool confirmed){
+    // LMIC.setTxData2(2, &val, 1, false);
+    if (LMIC.getOpMode().test(OpState::TXRXPEND)) {
+        PRINT_DEBUG(2, F("OpState::TXRXPEND, not sending"));
+        return false;
+    } else {
+        LMIC.setTxData2(port, data, dlen, confirmed);
+        return true;
+    }
+}
 
 /**
  * If we have a valid position send it to the server.
@@ -72,18 +234,10 @@ bool trySend() {
 
         buildPacket(txBuffer);
 
-    #if LORAWAN_CONFIRMED_EVERY > 0
-        bool confirmed = (ttn_get_count() % LORAWAN_CONFIRMED_EVERY == 0);
-        if (confirmed){ Serial.println("confirmation enabled"); }
-    #else
-        bool confirmed = false;
-    #endif
-
-    packetQueued = true;
-    ttn_send(txBuffer, sizeof(txBuffer), LORAWAN_PORT, confirmed);
-    return true;
-    }
-    else {
+        packetQueued = true;
+        // ttn_send(txBuffer, sizeof(txBuffer), LORAWAN_PORT, confirmed);
+        return lora_send(txBuffer, sizeof(txBuffer), LORAWAN_PORT, false);
+    } else {
         return false;
     }
 }
@@ -97,7 +251,14 @@ void doDeepSleep(uint64_t msecToWake)
     // esp_wifi_stop();
 
     screen_off();  // datasheet says this will draw only 10ua
-    LMIC_shutdown();  // cleanly shutdown the radio
+
+    // LMIC_shutdown();  // cleanly shutdown the radio
+    // we have transmit
+    // save before going to deep sleep.
+    auto store = StoringBuffer{saveState};
+    LMIC.saveState(store);
+    saveState[300] = 51;
+    PRINT_DEBUG(2, F("LMIC Store Saved"));
     
     if(axp192_found) {
         // turn on after initial testing with real hardware
@@ -149,51 +310,6 @@ void sleep() {
 
 #endif
 }
-
-
-void callback(uint8_t message) {
-    bool ttn_joined = false;
-    if (EV_JOINED == message) {
-        ttn_joined = true;
-    }
-    if (EV_JOINING == message) {
-        if (ttn_joined) {
-            screen_print("TTN joining...\n");
-        } else {
-            screen_print("Joined TTN!\n");
-        }
-    }
-    if (EV_JOIN_FAILED == message) screen_print("TTN join failed\n");
-    if (EV_REJOIN_FAILED == message) screen_print("TTN rejoin failed\n");
-    if (EV_RESET == message) screen_print("Reset TTN connection\n");
-    if (EV_LINK_DEAD == message) screen_print("TTN link dead\n");
-    if (EV_ACK == message) screen_print("ACK received\n");
-    if (EV_PENDING == message) screen_print("Message discarded\n");
-    if (EV_QUEUED == message) screen_print("Message queued\n");
-
-    // We only want to say 'packetSent' for our packets (not packets needed for joining)
-    if (EV_TXCOMPLETE == message && packetQueued) {
-        screen_print("Message sent\n");
-        packetQueued = false;
-        packetSent = true;
-    }
-
-    if (EV_RESPONSE == message) {
-        screen_print("[TTN] Response: ");
-
-        size_t len = ttn_response_len();
-        uint8_t data[len];
-        ttn_response(data, len);
-
-        char buffer[6];
-        for (uint8_t i = 0; i < len; i++) {
-            snprintf(buffer, sizeof(buffer), "%02X", data[i]);
-            screen_print(buffer);
-        }
-        screen_print("\n");
-    }
-}
-
 
 void scanI2Cdevice(void)
 {
@@ -353,6 +469,7 @@ void setup()
     #endif
 
     // TTN setup
+    /*
     if (!ttn_setup()) {
         screen_print("[ERR] Radio module not found!\n");
 
@@ -367,11 +484,15 @@ void setup()
         ttn_join();
         ttn_adr(LORAWAN_ADR);
     }
+    */
+    lora_init();
+    lora_setup();
 }
 
 void loop() {
     gps_loop();
-    ttn_loop();
+    // ttn_loop();
+    LMIC.run();
     screen_loop();
 
     if (packetSent) {
@@ -401,7 +522,7 @@ void loop() {
 
             #ifdef PREFS_DISCARD
                 screen_print("Discarding prefs!\n");
-                ttn_erase_prefs();
+                // ttn_erase_prefs();
                 delay(5000);  // Give some time to read the screen
                 ESP.restart();
             #endif
